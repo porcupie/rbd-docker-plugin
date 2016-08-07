@@ -138,6 +138,13 @@ func newCephRBDVolumeDriver(pluginName, cluster, userName, defaultPoolName, root
 //
 // ************************************************************
 
+// Capabilities returns the capabilities for volume.
+// Since 1.12.0 (https://docs.docker.com/engine/extend/plugins_volume/)
+func (d cephRBDVolumeDriver) Capabilities(r dkvolume.Request) dkvolume.Response {
+	log.Printf("WARN: Capabilities not implemented!")
+	return dkvolume.Response{Capabilities: dkvolume.Capability{Scope: "Capabilities not implemented"}}
+}
+
 // Create will ensure the RBD image requested is available.  Plugin requires
 // --create option to provision new RBD images.
 //
@@ -344,7 +351,7 @@ func (d cephRBDVolumeDriver) Remove(r dkvolume.Request) dkvolume.Response {
 //    Respond with the path on the host filesystem where the volume has been
 //    made available, and/or a string error if an error occurred.
 //
-func (d cephRBDVolumeDriver) Mount(r dkvolume.Request) dkvolume.Response {
+func (d cephRBDVolumeDriver) Mount(r dkvolume.MountRequest) dkvolume.Response {
 	log.Printf("INFO: API Mount(%s)", r)
 	d.m.Lock()
 	defer d.m.Unlock()
@@ -541,7 +548,7 @@ func (d cephRBDVolumeDriver) Path(r dkvolume.Request) dkvolume.Response {
 // unmounted/unmapped/unlocked while possibly in use by another container --
 // revisit the API, are we doing something wrong or perhaps we can fail sooner
 //
-func (d cephRBDVolumeDriver) Unmount(r dkvolume.Request) dkvolume.Response {
+func (d cephRBDVolumeDriver) Unmount(r dkvolume.UnmountRequest) dkvolume.Response {
 	log.Printf("INFO: API Unmount(%s)", r)
 	d.m.Lock()
 	defer d.m.Unlock()
@@ -777,14 +784,9 @@ func (d *cephRBDVolumeDriver) goceph_rbdImageExists(pool, findName string) (bool
 		return false, fmt.Errorf("Empty Ceph RBD Image name")
 	}
 
-	ctx, err := d.openContext(pool)
-	if err != nil {
-		return false, err
-	}
-	defer d.shutdownContext(ctx)
-
-	img := rbd.GetImage(ctx, findName)
-	err = img.Open(true)
+	img := rbd.GetImage(d.ioctx, findName)
+	err := img.Open(true)
+	
 	defer img.Close()
 	if err != nil {
 		if err == rbd.RbdErrorNotFound {
