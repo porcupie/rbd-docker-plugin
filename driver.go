@@ -62,6 +62,12 @@ type Volume struct {
 	pool   string
 }
 
+type Lock struct {
+	locker  string
+	id      string
+	address string
+}
+
 // TODO: finish modularizing and split out go-ceph and shell-cli implementations
 //
 // in progress: interface to abstract the ceph operations - either go-ceph lib or sh cli commands
@@ -137,6 +143,13 @@ func newCephRBDVolumeDriver(pluginName, cluster, userName, defaultPoolName, root
 // Using https://github.com/docker/go-plugins-helpers/tree/master/volume
 //
 // ************************************************************
+
+// Capabilities returns the capabilities for volume.
+// Since 1.12.0 (https://docs.docker.com/engine/extend/plugins_volume/)
+func (d cephRBDVolumeDriver) Capabilities(r dkvolume.Request) dkvolume.Response {
+	log.Printf("WARN: Capabilities not implemented!")
+	return dkvolume.Response{Capabilities: dkvolume.Capability{Scope: "Capabilities not implemented"}}
+}
 
 // Create will ensure the RBD image requested is available.  Plugin requires
 // --create option to provision new RBD images.
@@ -344,7 +357,7 @@ func (d cephRBDVolumeDriver) Remove(r dkvolume.Request) dkvolume.Response {
 //    Respond with the path on the host filesystem where the volume has been
 //    made available, and/or a string error if an error occurred.
 //
-func (d cephRBDVolumeDriver) Mount(r dkvolume.Request) dkvolume.Response {
+func (d cephRBDVolumeDriver) Mount(r dkvolume.MountRequest) dkvolume.Response {
 	log.Printf("INFO: API Mount(%s)", r)
 	d.m.Lock()
 	defer d.m.Unlock()
@@ -369,8 +382,39 @@ func (d cephRBDVolumeDriver) Mount(r dkvolume.Request) dkvolume.Response {
 	// attempt to lock
 	locker, err := d.lockImage(pool, name)
 	if err != nil {
-		log.Printf("ERROR: locking RBD Image(%s): %s", name, err)
-		return dkvolume.Response{Err: "Unable to get Exclusive Lock"}
+		if *canOverrideLock {
+			// Image is locked, we are going to override the lock
+
+			lockers, err := d.sh_getImageLocks(pool, name)
+			if err != nil {
+				log.Printf("ERROR: locking RBD Image(%s): %s", name, err)
+				return dkvolume.Response{Err: "Unable to get Exclusive Lock"}
+			}
+
+			if len(lockers) != 1 {
+				log.Printf("ERROR: locking RBD Image(%s): lock count %i", name, len(lockers))
+				return dkvolume.Response{Err: "Unable to get Exclusive Lock"}
+			}
+
+			// Ok, we have one single valid lock
+			img_locker := lockers[0]
+
+			// Lock is not ours, we will take over
+			// If lock is ours, we will do nothing and continue to try to map
+			// Map os same block device on the same host twice should fail
+
+			if img_locker.id != locker {	
+				err = d.sh_takeOverLock(pool, name, img_locker)
+				if err != nil {
+					log.Printf("ERROR: locking RBD Image(%s): %s", name, err)
+					return dkvolume.Response{Err: "Unable to get Exclusive Lock"}
+				}				
+			}
+
+		} else {
+			log.Printf("ERROR: locking RBD Image(%s): %s", name, err)
+			return dkvolume.Response{Err: "Unable to get Exclusive Lock"}
+		}
 	}
 
 	// map and mount the RBD image -- these are OS level commands, not avail in go-ceph
@@ -541,7 +585,7 @@ func (d cephRBDVolumeDriver) Path(r dkvolume.Request) dkvolume.Response {
 // unmounted/unmapped/unlocked while possibly in use by another container --
 // revisit the API, are we doing something wrong or perhaps we can fail sooner
 //
-func (d cephRBDVolumeDriver) Unmount(r dkvolume.Request) dkvolume.Response {
+func (d cephRBDVolumeDriver) Unmount(r dkvolume.UnmountRequest) dkvolume.Response {
 	log.Printf("INFO: API Unmount(%s)", r)
 	d.m.Lock()
 	defer d.m.Unlock()
@@ -777,14 +821,9 @@ func (d *cephRBDVolumeDriver) goceph_rbdImageExists(pool, findName string) (bool
 		return false, fmt.Errorf("Empty Ceph RBD Image name")
 	}
 
-	ctx, err := d.openContext(pool)
-	if err != nil {
-		return false, err
-	}
-	defer d.shutdownContext(ctx)
+	img := rbd.GetImage(d.ioctx, findName)
+	err := img.Open(true)
 
-	img := rbd.GetImage(ctx, findName)
-	err = img.Open(true)
 	defer img.Close()
 	if err != nil {
 		if err == rbd.RbdErrorNotFound {
@@ -936,7 +975,7 @@ func (d *cephRBDVolumeDriver) sh_lockImage(pool, imagename string) (string, erro
 	cookie := d.localLockerCookie()
 	_, err := d.rbdsh(pool, "lock", "add", imagename, cookie)
 	if err != nil {
-		return "", err
+		return cookie, err
 	}
 	return cookie, nil
 }
@@ -989,26 +1028,36 @@ func (d *cephRBDVolumeDriver) unlockImage(pool, imagename, locker string) error 
 	return d.sh_unlockImage(pool, imagename, locker)
 }
 
-func (d *cephRBDVolumeDriver) sh_unlockImage(pool, imagename, locker string) error {
-	// first - we need to discover the client id of the locker -- so we have to
-	// `rbd lock list` and grep out fields
+func (d *cephRBDVolumeDriver) sh_getImageLocks(pool, imagename string) ([]Lock, error) {
 	out, err := d.rbdsh(pool, "lock", "list", imagename)
-	if err != nil || out == "" {
-		log.Printf("ERROR: image not locked or ceph rbd error: %s", err)
-		return err
+	result := []Lock{}
+
+	if err != nil {
+		log.Printf("ERROR: ceph rbd error: %s", err)
+		return nil, err
 	}
 
-	// parse out client id -- assume we looking for a line with the locker cookie on it --
-	var clientid string
-	lines := grepLines(out, locker)
-	if isDebugEnabled() {
-		log.Printf("DEBUG: found lines matching %s:\n%s\n", locker, lines)
+	lines := regexpLines(out, `^(\S*\.\d+)\s(\S+)\s(\S+\/\d+)$`)
+
+	for _,line := range lines {
+		if isDebugEnabled() {
+			log.Printf("DEBUG: found locker [%s] [%s] [%s]\n", line[1], line[2], line[3])
+		}		
+		result = append(result, Lock{ locker: line[1], id: line[2], address: line[3] })
 	}
-	if len(lines) == 1 {
-		// grab first word of first line as the client.id ?
-		tokens := strings.SplitN(lines[0], " ", 2)
-		if tokens[0] != "" {
-			clientid = tokens[0]
+
+	return result, err
+}
+
+func (d *cephRBDVolumeDriver) sh_unlockImage(pool, imagename, locker string) error {
+	// first - we need to discover the client id of the locker
+	var clientid string
+	lockers, err := d.sh_getImageLocks(pool, imagename)
+	if len(lockers) == 1 {
+		for _,lckr := range lockers {
+			if lckr.id == locker {
+				clientid = lckr.locker
+			}
 		}
 	}
 
@@ -1020,6 +1069,35 @@ func (d *cephRBDVolumeDriver) sh_unlockImage(pool, imagename, locker string) err
 	if err != nil {
 		return err
 	}
+	return nil
+}
+
+func (d *cephRBDVolumeDriver) sh_takeOverLock(pool, imagename string, locker Lock) error {
+	var err error
+	
+	// First we will try to unlock and relock again
+	_, err = d.rbdsh(pool, "lock", "rm", imagename, locker.id, locker.locker)
+	if err != nil {
+		log.Printf("ERROR: can't remove lock from image(%s): %s", imagename, err)
+		return err
+	}
+
+	_, err = d.sh_lockImage(pool, imagename)
+	if err != nil {
+		log.Printf("ERROR: can't relock image(%s): %s", imagename, err)
+		return err
+	}
+
+	// Here WE have the lock, now we need to fence the other locker
+	// If we fail, the lock will be left and we will return error
+	_, err = d.cephsh("osd", "blacklist", "add", locker.address)
+	if err != nil {
+		log.Printf("ERROR: can't blacklist client(%s): %s", locker.address, err)
+		return err
+	}
+
+	// Here we have the lock for us, we can continue
+
 	return nil
 }
 
@@ -1160,4 +1238,10 @@ func (d *cephRBDVolumeDriver) rbdsh(pool, command string, args ...string) (strin
 		args = append([]string{"--pool", pool}, args...)
 	}
 	return shWithDefaultTimeout("rbd", args...)
+}
+
+// cephsh will call ceph with the given command arguments, also adding config and user flags
+func (d *cephRBDVolumeDriver) cephsh(command string, args ...string) (string, error) {
+	args = append([]string{"--conf", d.config, "--id", d.user, command}, args...)
+	return shWithDefaultTimeout("ceph", args...)
 }
