@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"regexp"
 )
 
 var (
@@ -81,6 +82,30 @@ func grepLines(data string, like string) []string {
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("WARN: error scanning string for %s: %s", like, err)
+	}
+
+	return result
+}
+
+// regexpLines pulls out lines that match a regexp as group matches
+func regexpLines(data string, regexp_s string) [][]string {
+	var result = [][]string{}
+
+  r, err := regexp.Compile(regexp_s)
+  if err != nil {
+      log.Printf("ERROR: unable to compile regexp")
+      return result
+  }
+
+	scanner := bufio.NewScanner(strings.NewReader(data))
+	for scanner.Scan() {
+		s := scanner.Text()
+		if r.MatchString(s) {
+			result = append(result, r.FindStringSubmatch(s))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("WARN: error scanning string for %s: %s", regexp_s, err)
 	}
 
 	return result

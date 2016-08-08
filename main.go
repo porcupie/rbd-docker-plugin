@@ -33,6 +33,7 @@ var (
 	rootMountDir       = flag.String("mount", dkvolume.DefaultDockerRootDirectory, "Mount directory for volumes on host")
 	logDir             = flag.String("logdir", "/var/log", "Logfile directory")
 	canCreateVolumes   = flag.Bool("create", false, "Can auto Create RBD Images")
+	canOverrideLock    = flag.Bool("override-lock", false, "Can override locks on images using fencing method")
 	defaultImageSizeMB = flag.Int("size", 20*1024, "RBD Image size to Create (in MB) (default: 20480=20GB)")
 	defaultImageFSType = flag.String("fs", "xfs", "FS type for the created RBD Image (must have mkfs.type)")
 	useGoCeph          = flag.Bool("go-ceph", false, "Use go-ceph library (default: false)")
