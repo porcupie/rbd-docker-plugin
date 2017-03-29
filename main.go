@@ -12,7 +12,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	dkvolume "github.com/docker/go-plugins-helpers/volume"
@@ -36,6 +38,7 @@ var (
 	defaultImageSizeMB = flag.Int("size", 20*1024, "RBD Image size to Create (in MB) (default: 20480=20GB)")
 	defaultImageFSType = flag.String("fs", "xfs", "FS type for the created RBD Image (must have mkfs.type)")
 	useGoCeph          = flag.Bool("go-ceph", false, "Use go-ceph library (default: false)")
+	useNbd             = flag.Bool("use-nbd", false, "Use rbd-nbd to map RBD Image (default: false)")
 )
 
 // setup a validating flag for remove action
@@ -92,7 +95,8 @@ func main() {
 	log.Printf("INFO: starting rbd-docker-plugin version %s", VERSION)
 	log.Printf("INFO: canCreateVolumes=%q, removeAction=%q", *canCreateVolumes, removeActionFlag)
 	log.Printf(
-		"INFO: Setting up Ceph Driver for PluginID=%s, cluster=%s, user=%s, pool=%s, mount=%s, config=%s, go-ceph=%s",
+		`INFO: Setting up Ceph Driver for PluginID=%s, cluster=%s, user=%s, pool=%s, mount=%s, 
+			config=%s, go-ceph=%s, useNbd=%s`,
 		*pluginName,
 		*cephCluster,
 		*cephUser,
@@ -100,6 +104,7 @@ func main() {
 		*rootMountDir,
 		*cephConfigFile,
 		*useGoCeph,
+		*useNbd,
 	)
 
 	// double check for config file - required especially for non-standard configs
@@ -119,6 +124,7 @@ func main() {
 		*rootMountDir,
 		*cephConfigFile,
 		*useGoCeph,
+		*useNbd,
 	)
 	if *useGoCeph {
 		defer d.shutdown()
@@ -126,14 +132,6 @@ func main() {
 
 	log.Println("INFO: Creating Docker VolumeDriver Handler")
 	h := dkvolume.NewHandler(d)
-
-	socket := socketPath()
-	log.Printf("INFO: Opening Socket for Docker to connect: %s", socket)
-	// ensure directory exists
-	err = os.MkdirAll(filepath.Dir(socket), os.ModeDir)
-	if err != nil {
-		log.Fatalf("FATAL: Error creating socket directory: %s", err)
-	}
 
 	// setup signal handling after logging setup and creating driver, in order to signal the logfile and ceph connection
 	// NOTE: systemd will send SIGTERM followed by SIGKILL after a timeout to stop a service daemon
@@ -155,8 +153,9 @@ func main() {
 		}
 	}()
 
-	// NOTE: pass empty string for group to skip broken chgrp in dkvolume lib
-	err = h.ServeUnix("", socket)
+	u, _ := user.Lookup("root")
+	gid, _ := strconv.Atoi(u.Gid)
+	err = h.ServeUnix(*pluginName, gid)
 
 	if err != nil {
 		log.Printf("ERROR: Unable to create UNIX socket: %v", err)

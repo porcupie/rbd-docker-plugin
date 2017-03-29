@@ -104,12 +104,14 @@ type cephRBDVolumeDriver struct {
 	m       *sync.Mutex        // mutex to guard operations that change volume maps or use conn
 
 	useGoCeph bool             // whether to setup/use go-ceph lib methods (default: false - use shell cli)
+	useNbd    bool             // whether to use rbd-nbd to map rbd image
 	conn      *rados.Conn      // create a connection for each API operation
 	ioctx     *rados.IOContext // context for requested pool
 }
 
 // newCephRBDVolumeDriver builds the driver struct, reads config file and connects to cluster
-func newCephRBDVolumeDriver(pluginName, cluster, userName, defaultPoolName, rootBase, config string, useGoCeph bool) cephRBDVolumeDriver {
+func newCephRBDVolumeDriver(pluginName, cluster, userName, defaultPoolName, rootBase, config string,
+	useGoCeph bool, useNbd bool) cephRBDVolumeDriver {
 	// the root mount dir will be based on docker default root and plugin name - pool added later per volume
 	mountDir := filepath.Join(rootBase, pluginName)
 	log.Printf("INFO: newCephRBDVolumeDriver: setting base mount dir=%s", mountDir)
@@ -125,6 +127,7 @@ func newCephRBDVolumeDriver(pluginName, cluster, userName, defaultPoolName, root
 		volumes:   map[string]*Volume{},
 		m:         &sync.Mutex{},
 		useGoCeph: useGoCeph,
+		useNbd:    useNbd,
 	}
 
 	return driver
@@ -860,12 +863,12 @@ func (d *cephRBDVolumeDriver) sh_createRBDImage(pool string, name string, size i
 	// NOTE: I also tried just image-features=4 (locking) - but map will fail:
 	//       sudo rbd unmap mynewvol =>  rbd: 'mynewvol' is not a block device, rbd: unmap failed: (22) Invalid argument
 	//	"--image-features", strconv.Itoa(4),
-	_, err = d.rbdsh(
-		pool, "create",
-		"--image-format", strconv.Itoa(2),
-		"--size", strconv.Itoa(size),
-		name,
-	)
+	args := append([]string{"--image-format", strconv.Itoa(2), "--size", strconv.Itoa(size), name})
+	if d.useNbd { // disable feature exclusive-lock
+		args = append([]string{"--image-feature", "layering", "--image-feature",
+			"deep-flatten"}, args...)
+	}
+	_, err = d.rbdsh(pool, "create", args...)
 	if err != nil {
 		return err
 	}
@@ -880,13 +883,16 @@ func (d *cephRBDVolumeDriver) sh_createRBDImage(pool string, name string, size i
 	// map to kernel device
 	device, err := d.mapImage(pool, name)
 	if err != nil {
+		log.Printf("DEBUG: nbd map image failed")
 		defer d.unlockImage(pool, name, lockname)
 		return err
 	}
 
+	log.Printf("DEBUG: nbd map image success")
 	// make the filesystem - give it some time
 	_, err = shWithTimeout(5*time.Minute, mkfs, device)
 	if err != nil {
+		log.Printf("DEBUG: mkfs failed")
 		defer d.unmapImageDevice(device)
 		defer d.unlockImage(pool, name, lockname)
 		return err
@@ -894,6 +900,7 @@ func (d *cephRBDVolumeDriver) sh_createRBDImage(pool string, name string, size i
 
 	// TODO: should we chown/chmod the directory? e.g. non-root container users won't be able to write
 
+	log.Printf("DEBUG: mkfs success")
 	// unmap
 	err = d.unmapImageDevice(device)
 	if err != nil {
@@ -1146,7 +1153,15 @@ func (d *cephRBDVolumeDriver) goceph_renameRBDImage(pool, name, newname string) 
 
 // mapImage will map the RBD Image to a kernel device
 func (d *cephRBDVolumeDriver) mapImage(pool, imagename string) (string, error) {
-	device, err := d.rbdsh(pool, "map", imagename)
+	var device = ""
+	var err error
+	if d.useNbd {
+		target := fmt.Sprintf("%s/%s", pool, imagename)
+		device, err = d.nbdsh("map", target, "")
+	} else {
+		device, err = d.rbdsh(pool, "map", imagename)
+	}
+	log.Printf("INFO: device %s", device)
 	// NOTE: ubuntu rbd map seems to not return device. if no error, assume "default" /dev/rbd/<pool>/<image> device
 	if device == "" && err == nil {
 		device = fmt.Sprintf("/dev/rbd/%s/%s", pool, imagename)
@@ -1158,7 +1173,12 @@ func (d *cephRBDVolumeDriver) mapImage(pool, imagename string) (string, error) {
 // unmapImageDevice will release the mapped kernel device
 func (d *cephRBDVolumeDriver) unmapImageDevice(device string) error {
 	// NOTE: this does not even require a user nor a pool, just device name
-	_, err := d.rbdsh("", "unmap", device)
+	var err error
+	if d.useNbd {
+		_, err = d.nbdsh("unmap", "", device)
+	} else {
+		_, err = d.rbdsh("", "unmap", device)
+	}
 	return err
 }
 
@@ -1253,4 +1273,18 @@ func (d *cephRBDVolumeDriver) rbdsh(pool, command string, args ...string) (strin
 		args = append([]string{"--pool", pool}, args...)
 	}
 	return shWithDefaultTimeout("rbd", args...)
+}
+
+// nbdsh will call rbd-nbd with the given arguments
+func (d *cephRBDVolumeDriver) nbdsh(command, target, device string, args ...string) (string, error) {
+	args = append([]string{"--conf", d.config, "--id", d.user}, args...)
+	if target != "" {
+		args = append([]string{target}, args...)
+	}
+	if device != "" {
+		args = append([]string{device}, args...)
+	}
+	args = append([]string{command}, args...)
+
+	return shWithDefaultTimeout("rbd-nbd", args...)
 }
