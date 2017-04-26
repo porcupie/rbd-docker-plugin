@@ -109,7 +109,15 @@ local:
 # container actions
 test_from_container: make/test
 
-
+rpms: version 	
+	cd ../ && tar -cjf rbd-docker-plugin.tar.bz2 rbd-docker-plugin && cd -
+	rm -rf ./rpmbuild
+	mkdir -p ./rpmbuild
+	mkdir -p ./rpmbuild/{BUILD,RPMS,S{OURCE,PEC,RPM}S}
+	cp rbd-docker-plugin.spec ./rpmbuild/SPECS
+	mv ../rbd-docker-plugin.tar.bz2 ./rpmbuild/SOURCES/
+	sed -i "s/@VERSION@/${VERSION}/g" ./rpmbuild/SPECS/rbd-docker-plugin.spec
+	cd ./rpmbuild/SPECS && rpmbuild -ba rbd-docker-plugin.spec
 
 # build relocatable tpkg
 # TODO: repair PATHS at install to set TPKG_HOME (assumed /home/ops)

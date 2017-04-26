@@ -24,6 +24,49 @@
       - ''delete'' - will actually delete ceph rbd image (destructive)
   * Get, List
 
+* for there is problems in "exclusive-lock" feature, it must be disabled
+
+* docer version >= 1.12.6
+  * we need docker request volume ID for umount operation
+
+* this plugin must run before docker daemon
+
+## user of this plugin must patch rbd-nbd tool
+
+we add lock in do\_map function.
+
+patch:
+
+	// rbd-nbd.cc
+	static int do_map()
+	{
+	   ....
+	  read_only = snapname.empty() ? 0 : 1;
+	  r = ioctl(nbd, BLKROSET, (unsigned long) &read_only);
+	  if (r < 0) {
+	    r = -errno;
+	    goto close_nbd;
+	  }
+	
+	   r = ioctl
+	   .....
+	
+	//Peng add exclusive lock during map
+	   r = image.lock_exclusive("db");
+	   if (r < 0) {
+	     cerr << " rbd-nbd: peng image.exclusive_lock fail " << std::endl;
+	     dout(0) <<" rbd-nbd terminating due to peng image.exclusive_lock fail "<<dendl;
+	     goto close_nbd;
+	   }
+	
+	   .....
+	}
+
+## Generate RPMs
+
+	$ sudo yum install -y rpm-build
+	$ make rpms
+
 ## Plugin Setup
 
 Plugin is a standalone process and places a Socket file in a known 
@@ -48,18 +91,40 @@ Tested with Ceph version 0.94.2 on Centos 7.1 host with Docker 1.8.
 
 ### Commandline Options
 
-    Usage of ./rbd-docker-plugin:
-      --ceph-user="admin": Ceph user to use for RBD
-      --create=false: Can auto Create RBD Images (default: false)
-      --fs="xfs": FS type for the created RBD Image (must have mkfs.type)
-      --logdir="/var/log": Logfile directory for RBD Docker Plugin
-      --mount="/var/lib/docker/volumes": Mount directory for volumes on host
-      --name="rbd": Docker plugin name for use on --volume-driver option
-      --plugin-dir="/run/docker/plugins": Docker plugin directory for socket
-      --pool="rbd": Default Ceph Pool for RBD operations
-      --remove=false: Can Remove (destroy) RBD Images (default: false, volume will be renamed zz_name)
-      --size=20480: RBD Image size to Create (in MB) (default: 20480=20GB
-
+	Usage of rbd-docker-plugin:
+	  -cluster string
+	        xtao ceph cluster (default "xtao")
+	  -config string
+	        Xtao ceph cluster config (default "/etc/ceph/xtao.conf")
+	  -create
+	        Can auto Create RBD Images (default true)
+	  -debug
+	        Debug output
+	  -fs string
+	        FS type for the created RBD Image (must be xfs now) (default "xfs")
+	  -go-ceph
+	        Use go-ceph library
+	  -logdir string
+	        Logfile directory (default "/var/log")
+	  -mount string
+	        Mount directory for volumes on host (default "/var/lib/docker-volumes")
+	  -name string
+	        Docker plugin name for use on --volume-driver option (default "rbd")
+	  -plugins string
+	        Docker plugin directory for socket (default "/run/docker/plugins")
+	  -pool string
+	        Default Ceph Pool for RBD operations (default "rbd")
+	  -remove value
+	        Action to take on Remove: ignore, delete or rename (default ignore)
+	  -size int
+	        RBD Image size to Create (in MB) (default: 20480=20GB) (default 20480)
+	  -use-nbd
+	        Use rbd-nbd to map RBD Image (default true)
+	  -user string
+	        Ceph user (default "admin")
+	  -version
+	        Print version
+	
 ### Running Plugin
 
 Start with the default options:

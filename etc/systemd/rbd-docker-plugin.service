@@ -1,15 +1,13 @@
-# systemd config for rbd-docker-plugin
 [Unit]
-Description=Ceph RBD Docker VolumeDriver Plugin
+Description=rbd Daemon
+After=network.target
 Wants=docker.service
 Before=docker.service
 
 [Service]
-ExecStart=/home/ops/bin/rbd-docker-plugin --create --config /etc/ceph/ceph.conf --plugins /run/docker/plugins
-Restart=on-failure
-# NOTE: this kill is not synchronous as recommended by systemd *shrug*
-# disabled for now - having odd plugin issues on reload need to debug further
-#ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=/usr/bin/rbd-docker-plugin -create -cluster xtao -config /etc/ceph/xtao.conf -use-nbd
+Restart=always
+RestartSec=0
 
 [Install]
 WantedBy=multi-user.target
