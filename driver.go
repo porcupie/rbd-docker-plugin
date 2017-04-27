@@ -1236,19 +1236,21 @@ func (d *cephRBDVolumeDriver) preemptRBDLock(pool, name string, locker Lock) err
 
 	// blacklist and lock rm
 	// remove the rbd image lock, lock remove will automatically add the previous lock
-	// client address into the osd blacklist with default expire time 1h
-	_, err = d.rbdsh(pool, "lock", "rm", name, locker.id, locker.locker)
+	// client address into the osd blacklist with default expire(1000000000="2049-01-03")
+	_, err = d.rbdsh(pool, "lock", "rm", name, locker.id, locker.locker,
+		"--expire", "1000000000")
 	if err != nil {
 		log.Printf("ERROR: lock image(%s) failed: %s", name, err)
 		return err
 	}
 
+	// As in 'lock rm' blacklist is added, we don't need add it again.
 	// update blacklist expire time to 'for ever'
-	_, err = d.cephsh("osd", "blacklist", "add", locker.address, "100000000000000000")
-	if err != nil {
-		log.Printf("ERROR: blacklist client(%s) failed: %s", locker.address, err)
-		return err
-	}
+	///_, err = d.cephsh("osd", "blacklist", "add", locker.address, "100000000000000000")
+	///if err != nil {
+	///	log.Printf("ERROR: blacklist client(%s) failed: %s", locker.address, err)
+	///	return err
+	///}
 
 	return nil
 }
@@ -1296,7 +1298,7 @@ func (d *cephRBDVolumeDriver) mapImage(pool, imagename string) (string, error) {
 	var err error
 	if d.useNbd {
 		target := fmt.Sprintf("%s/%s", pool, imagename)
-		device, err = d.nbdsh("map", target, "")
+		device, err = d.nbdsh("map", target, "", "--autolock")
 	} else {
 		device, err = d.rbdsh(pool, "map", imagename)
 	}

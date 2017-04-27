@@ -1,0 +1,208 @@
+diff --git a/src/include/rbd/librbd.hpp b/src/include/rbd/librbd.hpp
+index e4c434a..5366638 100644
+--- a/src/include/rbd/librbd.hpp
++++ b/src/include/rbd/librbd.hpp
+@@ -355,6 +355,7 @@ public:
+                             size_t info_size);
+   int mirror_image_get_status(mirror_image_status_t *mirror_image_status,
+ 			      size_t status_size);
++  void set_blacklist_expire_seconds(uint32_t expire);
+ 
+ private:
+   friend class RBD;
+diff --git a/src/librbd/librbd.cc b/src/librbd/librbd.cc
+index c31bd64..e2e8841 100644
+--- a/src/librbd/librbd.cc
++++ b/src/librbd/librbd.cc
+@@ -1297,6 +1297,11 @@ namespace librbd {
+ 					   status_size);
+   }
+ 
++  void Image::set_blacklist_expire_seconds(uint32_t expire) {
++    ImageCtx *ictx = (ImageCtx *)ctx;
++    ictx->blacklist_expire_seconds = expire;
++  }
++
+ } // namespace librbd
+ 
+ extern "C" void rbd_version(int *major, int *minor, int *extra)
+diff --git a/src/test/cli/rbd/help.t b/src/test/cli/rbd/help.t
+index 4848370..cf1e39d 100644
+--- a/src/test/cli/rbd/help.t
++++ b/src/test/cli/rbd/help.t
+@@ -708,7 +708,7 @@
+     --pretty-format      pretty formatting (json and xml)
+   
+   rbd help lock remove
+-  usage: rbd lock remove [--pool <pool>] [--image <image>] 
++  usage: rbd lock remove [--pool <pool>] [--image <image>] [--expire <expire>] 
+                          <image-spec> <lock-id> <locker> 
+   
+   Release a lock on an image.
+@@ -954,7 +954,7 @@
+   
+   rbd help nbd map
+   usage: rbd nbd map [--pool <pool>] [--image <image>] [--snap <snap>] 
+-                     [--read-only] [--device <device>] 
++                     [--read-only] [--device <device>] [--autolock] 
+                      <image-or-snap-spec> 
+   
+   Map image to a nbd device.
+@@ -968,6 +968,7 @@
+     --image arg           image name
+     --snap arg            snapshot name
+     --read-only           mount read-only
++    --autolock            get exclusive lock during map
+     --device arg          specify nbd device
+   
+   rbd help nbd unmap
+diff --git a/src/tools/rbd/ArgumentTypes.cc b/src/tools/rbd/ArgumentTypes.cc
+index 94355bb..e112e33 100644
+--- a/src/tools/rbd/ArgumentTypes.cc
++++ b/src/tools/rbd/ArgumentTypes.cc
+@@ -230,6 +230,12 @@ void add_create_image_options(po::options_description *opt,
+   add_create_journal_options(opt);
+ }
+ 
++void add_expire_option(boost::program_options::options_description *opt) {
++  opt->add_options()
++    ((EXPIRE + ",e").c_str(), po::value<uint32_t>()->default_value(0), 
++      "blacklist's expire time");
++}
++
+ void add_create_journal_options(po::options_description *opt) {
+   opt->add_options()
+     (JOURNAL_SPLAY_WIDTH.c_str(), po::value<uint64_t>(),
+diff --git a/src/tools/rbd/ArgumentTypes.h b/src/tools/rbd/ArgumentTypes.h
+index 50c74aa..a8b1c3b 100644
+--- a/src/tools/rbd/ArgumentTypes.h
++++ b/src/tools/rbd/ArgumentTypes.h
+@@ -77,6 +77,8 @@ static const std::string PRETTY_FORMAT("pretty-format");
+ static const std::string VERBOSE("verbose");
+ static const std::string NO_ERROR("no-error");
+ 
++static const std::string EXPIRE("expire");
++
+ static const std::set<std::string> SWITCH_ARGUMENTS = {
+   WHOLE_OBJECT, NO_PROGRESS, PRETTY_FORMAT, VERBOSE, NO_ERROR};
+ 
+@@ -147,6 +149,7 @@ void add_journal_spec_options(
+   boost::program_options::options_description *opt,
+   ArgumentModifier modifier);
+ 
++void add_expire_option(boost::program_options::options_description *opt);
+ void add_create_image_options(boost::program_options::options_description *opt,
+                               bool include_format);
+ 
+diff --git a/src/tools/rbd/action/Lock.cc b/src/tools/rbd/action/Lock.cc
+index f083caf..6ff3b95 100644
+--- a/src/tools/rbd/action/Lock.cc
++++ b/src/tools/rbd/action/Lock.cc
+@@ -9,6 +9,7 @@
+ #include "common/TextTable.h"
+ #include <iostream>
+ #include <boost/program_options.hpp>
++#include "librbd/ImageCtx.h"
+ 
+ namespace rbd {
+ namespace action {
+@@ -205,6 +206,7 @@ int execute_add(const po::variables_map &vm) {
+ void get_remove_arguments(po::options_description *positional,
+                           po::options_description *options) {
+   at::add_image_spec_options(positional, options, at::ARGUMENT_MODIFIER_NONE);
++  at::add_expire_option(options);
+   add_id_option(positional);
+   positional->add_options()
+     ("locker", "locker client");
+@@ -215,6 +217,13 @@ int execute_remove(const po::variables_map &vm) {
+   std::string pool_name;
+   std::string image_name;
+   std::string snap_name;
++
++  uint32_t expire = 0;
++
++  if (vm.count(at::EXPIRE)) {
++    expire = vm[at::EXPIRE].as<uint32_t>();
++  }
++
+   int r = utils::get_pool_image_snapshot_names(
+     vm, at::ARGUMENT_MODIFIER_NONE, &arg_index, &pool_name, &image_name,
+     &snap_name, utils::SNAPSHOT_PRESENCE_NONE, utils::SPEC_VALIDATION_NONE);
+@@ -243,6 +252,8 @@ int execute_remove(const po::variables_map &vm) {
+     return r;
+   }
+ 
++  image.set_blacklist_expire_seconds(expire);
++
+   r = do_lock_remove(image, lock_client.c_str(), lock_cookie.c_str());
+   if (r < 0) {
+     std::cerr << "rbd: releasing lock failed: " << cpp_strerror(r) << std::endl;
+diff --git a/src/tools/rbd/action/Nbd.cc b/src/tools/rbd/action/Nbd.cc
+index 478e42a..bd7d10c 100644
+--- a/src/tools/rbd/action/Nbd.cc
++++ b/src/tools/rbd/action/Nbd.cc
+@@ -100,7 +100,8 @@ void get_map_arguments(po::options_description *positional,
+                                      at::ARGUMENT_MODIFIER_NONE);
+   options->add_options()
+     ("read-only", po::bool_switch(), "mount read-only")
+-    ("device", po::value<std::string>(), "specify nbd device");
++    ("device", po::value<std::string>(), "specify nbd device")
++    ("autolock", po::bool_switch(), "add exclusive lock during map");
+ }
+ 
+ int execute_map(const po::variables_map &vm)
+@@ -138,6 +139,9 @@ int execute_map(const po::variables_map &vm)
+     args.push_back(vm["device"].as<std::string>().c_str());
+   }
+ 
++  if (vm["autolock"].as<bool>())
++    args.push_back("--autolock");
++
+   return call_nbd_cmd(vm, args);
+ }
+ 
+diff --git a/src/tools/rbd_nbd/rbd-nbd.cc b/src/tools/rbd_nbd/rbd-nbd.cc
+index f7e7531..d38f94f 100644
+--- a/src/tools/rbd_nbd/rbd-nbd.cc
++++ b/src/tools/rbd_nbd/rbd-nbd.cc
+@@ -62,6 +62,7 @@ static void usage()
+             << "Options:\n"
+             << "  --device <device path>                    Specify nbd device path\n"
+             << "  --read-only                               Map readonly\n"
++            << "  --autolock                                Add exclusive lock during map\n"
+             << "  --nbds_max <limit>                        Override for module param\n"
+             << std::endl;
+   generic_server_usage();
+@@ -70,6 +71,7 @@ static void usage()
+ static std::string devpath, poolname("rbd"), imgname, snapname;
+ static bool readonly = false;
+ static int nbds_max = 0;
++static bool autolock = false;
+ 
+ #ifdef CEPH_BIG_ENDIAN
+ #define ntohll(a) (a)
+@@ -570,6 +572,15 @@ static int do_map()
+   if (r < 0)
+     goto close_nbd;
+ 
++  if (autolock) {
++    r = image.lock_exclusive("db");
++    if (r < 0) {
++      cerr << " rbd-nbd: xtao image.exclusive_lock fail " << std::endl;
++      dout(0) <<" rbd-nbd terminating due to image.exclusive_lock fail "<<dendl;
++      goto close_nbd;
++    }
++  }
++
+   if (!snapname.empty()) {
+     r = image.snap_set(snapname.c_str());
+     if (r < 0)
+@@ -771,6 +782,8 @@ static int rbd_nbd(int argc, const char *argv[])
+       }
+     } else if (ceph_argparse_flag(args, i, "--read-only", (char *)NULL)) {
+       readonly = true;
++    } else if (ceph_argparse_flag(args, i, "--autolock", (char *)NULL)) {
++      autolock = true;
+     } else {
+       ++i;
+     }

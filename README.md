@@ -31,36 +31,9 @@
 
 * this plugin must run before docker daemon
 
-## user of this plugin must patch rbd-nbd tool
+## user of this plugin must apply patch ceph-patch/rbd-nbd-ceph-10.2.2.patch
 
 we add lock in do\_map function.
-
-patch:
-
-	// rbd-nbd.cc
-	static int do_map()
-	{
-	   ....
-	  read_only = snapname.empty() ? 0 : 1;
-	  r = ioctl(nbd, BLKROSET, (unsigned long) &read_only);
-	  if (r < 0) {
-	    r = -errno;
-	    goto close_nbd;
-	  }
-	
-	   r = ioctl
-	   .....
-	
-	//Peng add exclusive lock during map
-	   r = image.lock_exclusive("db");
-	   if (r < 0) {
-	     cerr << " rbd-nbd: peng image.exclusive_lock fail " << std::endl;
-	     dout(0) <<" rbd-nbd terminating due to peng image.exclusive_lock fail "<<dendl;
-	     goto close_nbd;
-	   }
-	
-	   .....
-	}
 
 ## Generate RPMs
 
