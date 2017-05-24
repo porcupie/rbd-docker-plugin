@@ -26,8 +26,6 @@
 
 * for there is problems in "exclusive-lock" feature, it must be disabled
 
-* docer version >= 1.12.6
-  * we need docker request volume ID for umount operation
 
 * this plugin must run before docker daemon
 
@@ -60,7 +58,8 @@ General build/run requirements:
 * /usr/sbin/mkfs.xfs for fs creation
 * /usr/bin/mount and /usr/bin/umount
 
-Tested with Ceph version 0.94.2 on Centos 7.1 host with Docker 1.8.
+Tested with Ceph version 10.2.2 on Centos 7.1 host with Docker 1.12.6 
+and docker api version 1.24.
 
 ### Commandline Options
 

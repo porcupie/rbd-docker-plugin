@@ -422,7 +422,7 @@ func (d cephRBDVolumeDriver) Mount(r dkvolume.MountRequest) dkvolume.Response {
 	err, mp := d.isMountpoint(mount_point)
 	if err != nil {
 		log.Printf("WARNING: check mount point failed: %s", err)
-		return dkvolume.Response{Err: err.Error()}
+		//return dkvolume.Response{Err: err.Error()}
 	}
 	if mp {
 		emsg := fmt.Sprintf("ERROR: mountpoin(%s) not clean", mount_point)
