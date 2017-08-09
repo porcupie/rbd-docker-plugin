@@ -20,11 +20,9 @@ var (
 // sh is a simple os.exec Command tool, returns trimmed string output
 func sh(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
-	if isDebugEnabled() {
-		log.Printf("DEBUG: sh CMD: %q", cmd)
-	}
-	// TODO: capture and output STDERR to logfile?
+	log.Printf("INFO: sh CMD: %q", cmd)
 	out, err := cmd.Output()
+	log.Printf("INFO: [out, err]/[%s, %s]", out, err)
 	return strings.Trim(string(out), " \n"), err
 }
 

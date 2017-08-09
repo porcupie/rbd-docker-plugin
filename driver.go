@@ -693,11 +693,18 @@ func (d cephRBDVolumeDriver) Unmount(r dkvolume.UnmountRequest) dkvolume.Respons
 		log.Printf("WARNNING: mountpoint(%s) is busy, do nothing", mount)
 		return dkvolume.Response{}
 	}
+
+	// shutdown xfs before umount
+	// application should make sure data is safely written to disk
+	// before reurun success
+	err = d.shutdownXfs(mount)
+	if err != nil {
+		log.Printf("ERROR: shutdown xfs path(%s): %s", mount, err)
+	}
 	err = d.unmountPath(mount)
 	if err != nil {
 		log.Printf("ERROR: unmounting path(%s): %s", mount, err)
-		// failsafe: will still attempt to unmap and unlock
-		err_msgs = append(err_msgs, "Error unmounting")
+		return dkvolume.Response{Err: err.Error()}
 	}
 
 	// unmap
@@ -710,7 +717,6 @@ func (d cephRBDVolumeDriver) Unmount(r dkvolume.UnmountRequest) dkvolume.Respons
 			log.Printf("WARN: unmap failed due to busy device, early exit from this Unmount request.")
 			return dkvolume.Response{Err: err.Error()}
 		}
-		// other error, failsafe: proceed to attempt to unlock
 		err_msgs = append(err_msgs, "Error unmapping kernel device")
 	}
 
@@ -1437,6 +1443,12 @@ func (d *cephRBDVolumeDriver) isMountpoint(path string) (error, bool) {
 // umount a path
 func (d *cephRBDVolumeDriver) unmountPath(path string) error {
 	_, err := shWithDefaultTimeout("umount", "-l", path)
+	return err
+}
+
+//  ref: https://bugzilla.redhat.com/show_bug.cgi?id=1103792
+func (d *cephRBDVolumeDriver) shutdownXfs(path string) error {
+	_, err := shWithDefaultTimeout("xfs_io", "-x", "-c", "shutdown", path)
 	return err
 }
 
