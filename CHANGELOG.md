@@ -8,6 +8,20 @@ We attempt to adhere to [Semantic Versioning](http://semver.org/).
 ### Removed
 ### Changed
 
+## [1.5.3] - 2017-04-26
+### Added
+- 'make rpms' can generate rpm packages
+- image lock preempt function
+
+### Removed
+- image auto rm
+
+## [1.5.2] - 2017-03-29
+### Added
+- User can map rbd image through rbd-nbd command now
+### Changed 
+- fix ServeUnix() gid parameter problem
+
 ## [1.5.1] - 2016-09-20
 ### Changed
 - Update XFS checks to mount/unmount to clear any disk logs

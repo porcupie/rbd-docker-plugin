@@ -57,9 +57,16 @@ var (
 type Volume struct {
 	name   string // RBD Image name
 	device string // local host kernel device (e.g. /dev/rbd1)
-	locker string // track the lock name
+	//	locker string // track the lock name
 	fstype string
 	pool   string
+	ID     string // volume ID
+}
+
+type Lock struct {
+	locker  string
+	id      string
+	address string
 }
 
 // TODO: finish modularizing and split out go-ceph and shell-cli implementations
@@ -104,12 +111,14 @@ type cephRBDVolumeDriver struct {
 	m       *sync.Mutex        // mutex to guard operations that change volume maps or use conn
 
 	useGoCeph bool             // whether to setup/use go-ceph lib methods (default: false - use shell cli)
+	useNbd    bool             // whether to use rbd-nbd to map rbd image
 	conn      *rados.Conn      // create a connection for each API operation
 	ioctx     *rados.IOContext // context for requested pool
 }
 
 // newCephRBDVolumeDriver builds the driver struct, reads config file and connects to cluster
-func newCephRBDVolumeDriver(pluginName, cluster, userName, defaultPoolName, rootBase, config string, useGoCeph bool) cephRBDVolumeDriver {
+func newCephRBDVolumeDriver(pluginName, cluster, userName, defaultPoolName, rootBase, config string,
+	useGoCeph bool, useNbd bool) cephRBDVolumeDriver {
 	// the root mount dir will be based on docker default root and plugin name - pool added later per volume
 	mountDir := filepath.Join(rootBase, pluginName)
 	log.Printf("INFO: newCephRBDVolumeDriver: setting base mount dir=%s", mountDir)
@@ -125,6 +134,7 @@ func newCephRBDVolumeDriver(pluginName, cluster, userName, defaultPoolName, root
 		volumes:   map[string]*Volume{},
 		m:         &sync.Mutex{},
 		useGoCeph: useGoCeph,
+		useNbd:    useNbd,
 	}
 
 	return driver
@@ -308,29 +318,37 @@ func (d cephRBDVolumeDriver) Remove(r dkvolume.Request) dkvolume.Response {
 		return dkvolume.Response{Err: errString}
 	}
 
+	// For data safety, we never do image delete operation
 	// remove action can be: ignore, delete or rename
-	if removeActionFlag == "delete" {
-		// delete it (for real - destroy it ... )
-		err = d.removeRBDImage(pool, name)
-		if err != nil {
-			errString := fmt.Sprintf("Unable to remove Ceph RBD Image(%s): %s", name, err)
-			log.Println("ERROR: " + errString)
-			defer d.unlockImage(pool, name, locker)
-			return dkvolume.Response{Err: errString}
-		}
-		defer d.unlockImage(pool, name, locker)
-	} else if removeActionFlag == "rename" {
+	//	if removeActionFlag == "delete" {
+	//		// delete it (for real - destroy it ... )
+	//		err = d.removeRBDImage(pool, name)
+	//		if err != nil {
+	//			errString := fmt.Sprintf("Unable to remove Ceph RBD Image(%s): %s", name, err)
+	//			log.Println("ERROR: " + errString)
+	//			defer d.unlockImage(pool, name, locker)
+	//			return dkvolume.Response{Err: errString}
+	//		}
+	//		defer d.unlockImage(pool, name, locker)
+	//	} else
+
+	if removeActionFlag == "rename" {
+		// add a timestamp prefix
+		t := time.Now()
+		prefix := t.Format("20060102150405")
+		new_name := fmt.Sprintf("%s_%s", prefix, name)
 		// just rename it (in case needed later, or can be culled via script)
-		err = d.renameRBDImage(pool, name, "zz_"+name)
+		err = d.renameRBDImage(pool, name, new_name)
 		if err != nil {
-			errString := fmt.Sprintf("Unable to rename with zz_ prefix: RBD Image(%s): %s", name, err)
+			errString := fmt.Sprintf("Unable to rename with %s prefix: RBD Image(%s): %s",
+				prefix, name, err)
 			log.Println("ERROR: " + errString)
 			// unlock by old name
 			defer d.unlockImage(pool, name, locker)
 			return dkvolume.Response{Err: errString}
 		}
 		// unlock by new name
-		defer d.unlockImage(pool, "zz_"+name, locker)
+		defer d.unlockImage(pool, new_name, locker)
 	} else {
 		// ignore the remove call - but unlock ?
 		defer d.unlockImage(pool, name, locker)
@@ -355,9 +373,8 @@ func (d cephRBDVolumeDriver) Remove(r dkvolume.Request) dkvolume.Response {
 //    Respond with the path on the host filesystem where the volume has been
 //    made available, and/or a string error if an error occurred.
 //
-// TODO: utilize the new MountRequest.ID field to track volumes
 func (d cephRBDVolumeDriver) Mount(r dkvolume.MountRequest) dkvolume.Response {
-	log.Printf("INFO: API Mount(%s)", r)
+	log.Printf("INFO: API Mount(%s), ID %s, r.Name %s", r, r.ID, r.Name)
 	d.m.Lock()
 	defer d.m.Unlock()
 
@@ -378,21 +395,66 @@ func (d cephRBDVolumeDriver) Mount(r dkvolume.MountRequest) dkvolume.Response {
 	//	return dkvolume.Response{Err: "RBD Image locked"}
 	//}
 
+	// As rbd-nbd* can auto lock the image, we don't need to get lock here
 	// attempt to lock
-	locker, err := d.lockImage(pool, name)
-	if err != nil {
-		log.Printf("ERROR: locking RBD Image(%s): %s", name, err)
-		return dkvolume.Response{Err: "Unable to get Exclusive Lock"}
-	}
+	//locker, err := d.lockImage(pool, name)
+	//if err != nil {
+	//	log.Printf("ERROR: locking RBD Image(%s): %s", name, err)
+	//	return dkvolume.Response{Err: "Unable to get Exclusive Lock"}
+	//}
 
 	// map and mount the RBD image -- these are OS level commands, not avail in go-ceph
+
+	// stop correspond docker container if it running on the same host
+	// or the host kernel maybe hung
+	// ref: http://stackoverflow.com/questions/30133664/how-do-you-list-volumes-in-docker-containers
+	//  docker inspect -f '{{ .Mounts }}' disk22
+	// As container ops in plugin will cause a deadlock, we can not stop container.
+	// If the mountpoint is not clean, just return failed. It's the HA's duty to do clear up.
+	//	err = d.stopDocker(r.Name)
+	//	if err != nil {
+	//		emsg := fmt.Sprintf("ERROR: stop container mounted %s failed: %s", r.Name, err)
+	//		log.Println(emsg)
+	//		return dkvolume.Response{Err: err.Error()}
+	//	}
+	// clear mount point
+	mount_point := d.mountpoint(pool, name)
+	err, mp := d.isMountpoint(mount_point)
+	if err != nil {
+		log.Printf("WARNING: check mount point failed: %s", err)
+		//return dkvolume.Response{Err: err.Error()}
+	}
+	if mp {
+		emsg := fmt.Sprintf("ERROR: mountpoin(%s) not clean", mount_point)
+		log.Printf(emsg)
+		return dkvolume.Response{Err: emsg}
+	}
+
+	lockers, err := d.sh_getImageLocks(pool, name)
+	if err != nil {
+		log.Printf("ERROR: locking RBD Image(%s): %s", name, err)
+		return dkvolume.Response{Err: "List image locks failed"}
+	}
+
+	if len(lockers) > 1 {
+		log.Printf("ERROR: More than one lock exist on image(%s)", name)
+		return dkvolume.Response{Err: "More than one lock"}
+	} else if len(lockers) == 1 {
+		// preempt lock
+		img_locker := lockers[0]
+		err = d.preemptRBDLock(pool, name, img_locker)
+		if err != nil {
+			log.Printf("ERROR: locking RBD image(%s) failed: %s", name, err)
+			return dkvolume.Response{Err: "Preempt lock failed"}
+		}
+	}
 
 	// map
 	device, err := d.mapImage(pool, name)
 	if err != nil {
 		log.Printf("ERROR: mapping RBD Image(%s) to kernel device: %s", name, err)
 		// failsafe: need to release lock
-		defer d.unlockImage(pool, name, locker)
+		//defer d.unlockImage(pool, name, locker)
 		return dkvolume.Response{Err: "Unable to map"}
 	}
 
@@ -410,7 +472,7 @@ func (d cephRBDVolumeDriver) Mount(r dkvolume.MountRequest) dkvolume.Response {
 		log.Printf("ERROR: filesystem may need repairs: %s", err)
 		// failsafe: need to release lock and unmap kernel device
 		defer d.unmapImageDevice(device)
-		defer d.unlockImage(pool, name, locker)
+		//defer d.unlockImage(pool, name, locker)
 		return dkvolume.Response{Err: "Image filesystem has errors, requires manual repairs"}
 	}
 
@@ -420,7 +482,7 @@ func (d cephRBDVolumeDriver) Mount(r dkvolume.MountRequest) dkvolume.Response {
 		log.Printf("ERROR: creating mount directory: %s", err)
 		// failsafe: need to release lock and unmap kernel device
 		defer d.unmapImageDevice(device)
-		defer d.unlockImage(pool, name, locker)
+		//defer d.unlockImage(pool, name, locker)
 		return dkvolume.Response{Err: "Unable to make mountdir"}
 	}
 
@@ -430,7 +492,7 @@ func (d cephRBDVolumeDriver) Mount(r dkvolume.MountRequest) dkvolume.Response {
 		log.Printf("ERROR: mounting device(%s) to directory(%s): %s", device, mount, err)
 		// need to release lock and unmap kernel device
 		defer d.unmapImageDevice(device)
-		defer d.unlockImage(pool, name, locker)
+		//defer d.unlockImage(pool, name, locker)
 		return dkvolume.Response{Err: "Unable to mount device"}
 	}
 
@@ -438,9 +500,10 @@ func (d cephRBDVolumeDriver) Mount(r dkvolume.MountRequest) dkvolume.Response {
 	d.volumes[mount] = &Volume{
 		name:   name,
 		device: device,
-		locker: locker,
+		//locker: locker,
 		fstype: fstype,
 		pool:   pool,
+		ID:     r.ID,
 	}
 
 	return dkvolume.Response{Mountpoint: mount}
@@ -495,6 +558,18 @@ func (d cephRBDVolumeDriver) Get(r dkvolume.Request) dkvolume.Response {
 	if err != nil {
 		log.Printf("ERROR: parsing volume: %s", err)
 		return dkvolume.Response{Err: err.Error()}
+	}
+
+	log.Printf("INFO: pool %s, name %s", pool, name)
+	// check volumes first
+	for k, v := range d.volumes {
+		log.Printf("INFO: name %s, mountpoint %s", v.name, k)
+
+		if strings.Contains(name, v.name) && strings.Contains(v.name, name) {
+			return dkvolume.Response{Volume: &dkvolume.Volume{
+				Name:       v.name,
+				Mountpoint: k}}
+		}
 	}
 
 	// Check to see if the image exists
@@ -563,7 +638,6 @@ func (d cephRBDVolumeDriver) Path(r dkvolume.Request) dkvolume.Response {
 // unmounted/unmapped/unlocked while possibly in use by another container --
 // revisit the API, are we doing something wrong or perhaps we can fail sooner
 //
-// TODO: utilize the new UnmountRequest.ID field to track volumes
 func (d cephRBDVolumeDriver) Unmount(r dkvolume.UnmountRequest) dkvolume.Response {
 	log.Printf("INFO: API Unmount(%s)", r)
 	d.m.Lock()
@@ -597,21 +671,40 @@ func (d cephRBDVolumeDriver) Unmount(r dkvolume.UnmountRequest) dkvolume.Respons
 		// set up a fake Volume with defaults ...
 		// - device is /dev/rbd/<pool>/<image> in newer ceph versions
 		// - assume we are the locker (will fail if locked from another host)
-		vol = &Volume{
-			pool:   pool,
-			name:   name,
-			device: fmt.Sprintf("/dev/rbd/%s/%s", pool, name),
-			locker: d.localLockerCookie(),
-		}
+		//###		vol = &Volume{
+		//###			pool:   pool,
+		//###			name:   name,
+		//###			device: fmt.Sprintf("/dev/rbd/%s/%s", pool, name),
+		//###			locker: d.localLockerCookie(),
+		//###		}
+		return dkvolume.Response{}
 	}
 
 	// unmount
 	// NOTE: this might succeed even if device is still in use inside container. device will dissappear from host side but still be usable inside container :(
-	err = d.unmountDevice(vol.device)
+	// we must check volume ID before umount, because:
+	// 1. container A is runing with disk2(mount point $BASE/rbd/disk2)
+	// 2. container B want to start with disk2 too. For the mount point is not clean, start failed.
+	//    however, docker will send a Unmount request to plugin. If we umount mount point,
+	// container A's IO will error.
+	//
+	// solution: volume's ID is different of these two kinds of umount request
+	if len(vol.ID) != 0 && (!strings.Contains(vol.ID, r.ID) || !strings.Contains(r.ID, vol.ID)) {
+		log.Printf("WARNNING: mountpoint(%s) is busy, do nothing", mount)
+		return dkvolume.Response{}
+	}
+
+	// shutdown xfs before umount
+	// application should make sure data is safely written to disk
+	// before reurun success
+	err = d.shutdownXfs(mount)
 	if err != nil {
-		log.Printf("ERROR: unmounting device(%s): %s", vol.device, err)
-		// failsafe: will still attempt to unmap and unlock
-		err_msgs = append(err_msgs, "Error unmounting device")
+		log.Printf("ERROR: shutdown xfs path(%s): %s", mount, err)
+	}
+	err = d.unmountPath(mount)
+	if err != nil {
+		log.Printf("ERROR: unmounting path(%s): %s", mount, err)
+		return dkvolume.Response{Err: err.Error()}
 	}
 
 	// unmap
@@ -624,16 +717,15 @@ func (d cephRBDVolumeDriver) Unmount(r dkvolume.UnmountRequest) dkvolume.Respons
 			log.Printf("WARN: unmap failed due to busy device, early exit from this Unmount request.")
 			return dkvolume.Response{Err: err.Error()}
 		}
-		// other error, failsafe: proceed to attempt to unlock
 		err_msgs = append(err_msgs, "Error unmapping kernel device")
 	}
 
 	// unlock
-	err = d.unlockImage(vol.pool, vol.name, vol.locker)
-	if err != nil {
-		log.Printf("ERROR: unlocking RBD image(%s): %s", vol.name, err)
-		err_msgs = append(err_msgs, "Error unlocking image")
-	}
+	//###	err = d.unlockImage(vol.pool, vol.name, vol.locker)
+	//###	if err != nil {
+	//###		log.Printf("ERROR: unlocking RBD image(%s): %s", vol.name, err)
+	//###		err_msgs = append(err_msgs, "Error unlocking image")
+	//###	}
 
 	// forget it
 	delete(d.volumes, mount)
@@ -860,40 +952,44 @@ func (d *cephRBDVolumeDriver) sh_createRBDImage(pool string, name string, size i
 	// NOTE: I also tried just image-features=4 (locking) - but map will fail:
 	//       sudo rbd unmap mynewvol =>  rbd: 'mynewvol' is not a block device, rbd: unmap failed: (22) Invalid argument
 	//	"--image-features", strconv.Itoa(4),
-	_, err = d.rbdsh(
-		pool, "create",
-		"--image-format", strconv.Itoa(2),
-		"--size", strconv.Itoa(size),
-		name,
-	)
+	args := append([]string{"--image-format", strconv.Itoa(2), "--size", strconv.Itoa(size), name})
+	if d.useNbd { // disable feature exclusive-lock
+		args = append([]string{"--image-feature", "layering", "--image-feature",
+			"deep-flatten"}, args...)
+	}
+	_, err = d.rbdsh(pool, "create", args...)
 	if err != nil {
 		return err
 	}
 
-	// lock it temporarily for fs creation
-	lockname, err := d.lockImage(pool, name)
-	if err != nil {
-		// TODO: defer image delete?
-		return err
-	}
+	//// lock it temporarily for fs creation
+	///	lockname, err := d.lockImage(pool, name)
+	///	if err != nil {
+	///		// TODO: defer image delete?
+	///		return err
+	///	}
 
 	// map to kernel device
 	device, err := d.mapImage(pool, name)
 	if err != nil {
-		defer d.unlockImage(pool, name, lockname)
+		log.Printf("DEBUG: nbd map image failed")
+		//defer d.unlockImage(pool, name, lockname)
 		return err
 	}
 
+	log.Printf("DEBUG: nbd map image success")
 	// make the filesystem - give it some time
 	_, err = shWithTimeout(5*time.Minute, mkfs, device)
 	if err != nil {
+		log.Printf("DEBUG: mkfs failed")
 		defer d.unmapImageDevice(device)
-		defer d.unlockImage(pool, name, lockname)
+		/////////###	defer d.unlockImage(pool, name, lockname)
 		return err
 	}
 
 	// TODO: should we chown/chmod the directory? e.g. non-root container users won't be able to write
 
+	log.Printf("DEBUG: mkfs success")
 	// unmap
 	err = d.unmapImageDevice(device)
 	if err != nil {
@@ -902,10 +998,10 @@ func (d *cephRBDVolumeDriver) sh_createRBDImage(pool string, name string, size i
 	}
 
 	// unlock
-	err = d.unlockImage(pool, name, lockname)
-	if err != nil {
-		return err
-	}
+	////###	err = d.unlockImage(pool, name, lockname)
+	////###	if err != nil {
+	////###		return err
+	////###	}
 
 	return nil
 }
@@ -1107,6 +1203,64 @@ func (d *cephRBDVolumeDriver) goceph_removeRBDImage(pool, name string) error {
 	return rbdImage.Remove()
 }
 
+// kill rbd-nbd process with the same poo/name
+func (d *cephRBDVolumeDriver) sh_kill_rbd_nbd(pool, name string) error {
+	procs := listProcesses()
+	target := fmt.Sprintf("%s/%s", pool, name)
+	for _, proc := range procs {
+		if strings.Contains(proc.Executable, target) && strings.Contains(proc.Executable,
+			"rbd-nbd map") {
+			log.Printf("INFO: kill %v:%v", proc.Pid, proc.Executable)
+			err := kill(proc, "9")
+			if err != nil {
+				log.Printf("ERROR: kill rbd-nbd daemon failed: %s", err)
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// preemptRBDLock will add existed locker to blacklist
+// NOTE: when this func returned, there can be other client try to lock this image
+func (d *cephRBDVolumeDriver) preemptRBDLock(pool, name string, locker Lock) error {
+	var err error
+
+	// we should never preempt locks not added by nbd-map
+	if !strings.Contains(locker.id, "db") || !strings.Contains("db", locker.id) {
+		log.Printf("ERROR: lock id(%s) is not 'db'", locker.id)
+		emsg := fmt.Sprintf("locker id(%s) is not 'db'", locker.id)
+		return errors.New(emsg)
+	}
+
+	// kill rbd-nbd daemon with the same pool/name
+	err = d.sh_kill_rbd_nbd(pool, name)
+	if err != nil {
+		log.Printf("INFO: %s", err)
+		return err
+	}
+
+	// blacklist and lock rm
+	// remove the rbd image lock, lock remove will automatically add the previous lock
+	// client address into the osd blacklist with default expire(1000000000="2049-01-03")
+	_, err = d.rbdsh(pool, "lock", "rm", name, locker.id, locker.locker,
+		"--expire", "1000000000")
+	if err != nil {
+		log.Printf("ERROR: lock image(%s) failed: %s", name, err)
+		return err
+	}
+
+	// As in 'lock rm' blacklist is added, we don't need add it again.
+	// update blacklist expire time to 'for ever'
+	///_, err = d.cephsh("osd", "blacklist", "add", locker.address, "100000000000000000")
+	///if err != nil {
+	///	log.Printf("ERROR: blacklist client(%s) failed: %s", locker.address, err)
+	///	return err
+	///}
+
+	return nil
+}
+
 // renameRBDImage will move a Ceph RBD image to new name
 func (d *cephRBDVolumeDriver) renameRBDImage(pool, name, newname string) error {
 	log.Println("INFO: Rename RBD Image(%s/%s -> %s)", pool, name, newname)
@@ -1146,7 +1300,15 @@ func (d *cephRBDVolumeDriver) goceph_renameRBDImage(pool, name, newname string) 
 
 // mapImage will map the RBD Image to a kernel device
 func (d *cephRBDVolumeDriver) mapImage(pool, imagename string) (string, error) {
-	device, err := d.rbdsh(pool, "map", imagename)
+	var device = ""
+	var err error
+	if d.useNbd {
+		target := fmt.Sprintf("%s/%s", pool, imagename)
+		device, err = d.nbdsh("map", target, "", "--autolock")
+	} else {
+		device, err = d.rbdsh(pool, "map", imagename)
+	}
+	log.Printf("INFO: device %s", device)
 	// NOTE: ubuntu rbd map seems to not return device. if no error, assume "default" /dev/rbd/<pool>/<image> device
 	if device == "" && err == nil {
 		device = fmt.Sprintf("/dev/rbd/%s/%s", pool, imagename)
@@ -1158,7 +1320,12 @@ func (d *cephRBDVolumeDriver) mapImage(pool, imagename string) (string, error) {
 // unmapImageDevice will release the mapped kernel device
 func (d *cephRBDVolumeDriver) unmapImageDevice(device string) error {
 	// NOTE: this does not even require a user nor a pool, just device name
-	_, err := d.rbdsh("", "unmap", device)
+	var err error
+	if d.useNbd {
+		_, err = d.nbdsh("unmap", "", device)
+	} else {
+		_, err = d.rbdsh("", "unmap", device)
+	}
 	return err
 }
 
@@ -1212,6 +1379,15 @@ func (d *cephRBDVolumeDriver) xfsRepairDryRun(device string) error {
 	return err
 }
 
+func (d *cephRBDVolumeDriver) xfsRepair(device string) error {
+	log.Printf("WARN: xfs repair begin for %s", device)
+	// timeout is 10min
+	_, err := shWithTimeout(10*60*time.Second, "xfs_repair", device)
+	log.Printf("WARN: xfs repair end for %s", device)
+
+	return err
+}
+
 // attemptLimitedXFSRepair will try mount/unmount and return result of another xfs-repair-n
 func (d *cephRBDVolumeDriver) attemptLimitedXFSRepair(fstype, device, mount string) (err error) {
 	log.Printf("WARN: attempting limited XFS repair (mount/unmount) of %s  %s", device, mount)
@@ -1228,8 +1404,8 @@ func (d *cephRBDVolumeDriver) attemptLimitedXFSRepair(fstype, device, mount stri
 		return err
 	}
 
-	// try a dry-run again and return result
-	return d.xfsRepairDryRun(device)
+	// repair fs
+	return d.xfsRepair(device)
 }
 
 // mountDevice will call mount on kernel device with a docker volume subdirectory
@@ -1244,6 +1420,38 @@ func (d *cephRBDVolumeDriver) unmountDevice(device string) error {
 	return err
 }
 
+// check if a path is a mountpoint
+func (d *cephRBDVolumeDriver) isMountpoint(path string) (error, bool) {
+
+	// check if dir exist
+	fInfo, e := os.Stat(path)
+	if e != nil || !fInfo.IsDir() {
+		emsg := fmt.Sprintf("path(%s) invalid", path)
+		return errors.New(emsg), false
+	}
+
+	out, err := shWithDefaultTimeout("mountpoint", path)
+	if err != nil {
+		return nil, false
+	}
+	if strings.Contains(out, "is a mountpoint") {
+		return nil, true
+	}
+	return nil, false
+}
+
+// umount a path
+func (d *cephRBDVolumeDriver) unmountPath(path string) error {
+	_, err := shWithDefaultTimeout("umount", "-l", path)
+	return err
+}
+
+//  ref: https://bugzilla.redhat.com/show_bug.cgi?id=1103792
+func (d *cephRBDVolumeDriver) shutdownXfs(path string) error {
+	_, err := shWithDefaultTimeout("xfs_io", "-x", "-c", "shutdown", path)
+	return err
+}
+
 // UTIL
 
 // rbdsh will call rbd with the given command arguments, also adding config, user and pool flags
@@ -1253,4 +1461,41 @@ func (d *cephRBDVolumeDriver) rbdsh(pool, command string, args ...string) (strin
 		args = append([]string{"--pool", pool}, args...)
 	}
 	return shWithDefaultTimeout("rbd", args...)
+}
+
+// nbdsh will call rbd-nbd with the given arguments
+func (d *cephRBDVolumeDriver) nbdsh(command, target, device string, args ...string) (string, error) {
+	args = append([]string{"--conf", d.config, "--id", d.user}, args...)
+	if target != "" {
+		args = append([]string{target}, args...)
+	}
+	if device != "" {
+		args = append([]string{device}, args...)
+	}
+	args = append([]string{command}, args...)
+
+	return shWithDefaultTimeout("rbd-nbd", args...)
+}
+
+func (d *cephRBDVolumeDriver) cephsh(command string, args ...string) (string, error) {
+	args = append([]string{"--conf", d.config, "--id", d.user, command}, args...)
+	return shWithDefaultTimeout("ceph", args...)
+}
+
+func (d *cephRBDVolumeDriver) sh_getImageLocks(pool, imagename string) ([]Lock, error) {
+	result := []Lock{}
+	out, err := d.rbdsh(pool, "lock", "list", imagename)
+	if err != nil {
+		log.Printf("ERROR: ceph rbd error: %s", err)
+		return nil, err
+	}
+
+	lines := regexpLines(out, `^(\S*\.\d+)\s(\S+)\s(\S+\/\d+)$`)
+	for _, line := range lines {
+		if isDebugEnabled() {
+			log.Printf("DEBUG: found locker [%s] [%s] [%s]\n", line[1], line[2], line[3])
+		}
+		result = append(result, Lock{locker: line[1], id: line[2], address: line[3]})
+	}
+	return result, err
 }

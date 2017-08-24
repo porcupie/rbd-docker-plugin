@@ -12,30 +12,34 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	dkvolume "github.com/docker/go-plugins-helpers/volume"
 )
 
 var (
-	VALID_REMOVE_ACTIONS = []string{"ignore", "delete", "rename"}
+	// Never delete rbd images
+	VALID_REMOVE_ACTIONS = []string{"ignore", "rename"}
 
 	// Plugin Option Flags
 	versionFlag        = flag.Bool("version", false, "Print version")
 	debugFlag          = flag.Bool("debug", false, "Debug output")
 	pluginName         = flag.String("name", "rbd", "Docker plugin name for use on --volume-driver option")
 	cephUser           = flag.String("user", "admin", "Ceph user")
-	cephConfigFile     = flag.String("config", "/etc/ceph/ceph.conf", "Ceph cluster config") // more likely to have config file pointing to cluster
-	cephCluster        = flag.String("cluster", "", "Ceph cluster")                          // less likely to run multiple clusters on same hardware
+	cephConfigFile     = flag.String("config", "/etc/ceph/xtao.conf", "Xtao ceph cluster config") // more likely to have config file pointing to cluster
+	cephCluster        = flag.String("cluster", "xtao", "xtao ceph cluster")                      // less likely to run multiple clusters on same hardware
 	defaultCephPool    = flag.String("pool", "rbd", "Default Ceph Pool for RBD operations")
 	pluginDir          = flag.String("plugins", "/run/docker/plugins", "Docker plugin directory for socket")
 	rootMountDir       = flag.String("mount", dkvolume.DefaultDockerRootDirectory, "Mount directory for volumes on host")
 	logDir             = flag.String("logdir", "/var/log", "Logfile directory")
-	canCreateVolumes   = flag.Bool("create", false, "Can auto Create RBD Images")
+	canCreateVolumes   = flag.Bool("create", true, "Can auto Create RBD Images")
 	defaultImageSizeMB = flag.Int("size", 20*1024, "RBD Image size to Create (in MB) (default: 20480=20GB)")
-	defaultImageFSType = flag.String("fs", "xfs", "FS type for the created RBD Image (must have mkfs.type)")
-	useGoCeph          = flag.Bool("go-ceph", false, "Use go-ceph library (default: false)")
+	defaultImageFSType = flag.String("fs", "xfs", "FS type for the created RBD Image (must be xfs now)")
+	useGoCeph          = flag.Bool("go-ceph", false, "Use go-ceph library")
+	useNbd             = flag.Bool("use-nbd", true, "Use rbd-nbd to map RBD Image")
 )
 
 // setup a validating flag for remove action
@@ -92,7 +96,8 @@ func main() {
 	log.Printf("INFO: starting rbd-docker-plugin version %s", VERSION)
 	log.Printf("INFO: canCreateVolumes=%q, removeAction=%q", *canCreateVolumes, removeActionFlag)
 	log.Printf(
-		"INFO: Setting up Ceph Driver for PluginID=%s, cluster=%s, user=%s, pool=%s, mount=%s, config=%s, go-ceph=%s",
+		`INFO: Setting up Ceph Driver for PluginID=%s, cluster=%s, user=%s, pool=%s, mount=%s, 
+			config=%s, go-ceph=%s, useNbd=%s`,
 		*pluginName,
 		*cephCluster,
 		*cephUser,
@@ -100,6 +105,7 @@ func main() {
 		*rootMountDir,
 		*cephConfigFile,
 		*useGoCeph,
+		*useNbd,
 	)
 
 	// double check for config file - required especially for non-standard configs
@@ -119,6 +125,7 @@ func main() {
 		*rootMountDir,
 		*cephConfigFile,
 		*useGoCeph,
+		*useNbd,
 	)
 	if *useGoCeph {
 		defer d.shutdown()
@@ -126,14 +133,6 @@ func main() {
 
 	log.Println("INFO: Creating Docker VolumeDriver Handler")
 	h := dkvolume.NewHandler(d)
-
-	socket := socketPath()
-	log.Printf("INFO: Opening Socket for Docker to connect: %s", socket)
-	// ensure directory exists
-	err = os.MkdirAll(filepath.Dir(socket), os.ModeDir)
-	if err != nil {
-		log.Fatalf("FATAL: Error creating socket directory: %s", err)
-	}
 
 	// setup signal handling after logging setup and creating driver, in order to signal the logfile and ceph connection
 	// NOTE: systemd will send SIGTERM followed by SIGKILL after a timeout to stop a service daemon
@@ -155,12 +154,14 @@ func main() {
 		}
 	}()
 
-	// NOTE: pass empty string for group to skip broken chgrp in dkvolume lib
-	err = h.ServeUnix("", socket)
+	u, _ := user.Lookup("root")
+	gid, _ := strconv.Atoi(u.Gid)
+	err = h.ServeUnix(*pluginName, gid)
 
 	if err != nil {
 		log.Printf("ERROR: Unable to create UNIX socket: %v", err)
 	}
+
 }
 
 // isDebugEnabled checks for RBD_DOCKER_PLUGIN_DEBUG environment variable
