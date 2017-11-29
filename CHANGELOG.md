@@ -8,6 +8,13 @@ We attempt to adhere to [Semantic Versioning](http://semver.org/).
 ### Removed
 ### Changed
 
+## [2.0.2] - 2017-08-28
+### Changed
+- Revert to previous Unmount behavior that would attempt a limited
+  unmount in the case volume is not in memory array. This can also occur
+when plugin is restarted so we want to unmount volumes started with old
+plugin
+
 ## [2.0.1] - 2017-08-28
 ### Changed
 - fixed List and Get methods to only return Mountpoint value if volume is
