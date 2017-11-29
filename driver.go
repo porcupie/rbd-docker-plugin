@@ -541,21 +541,20 @@ func (d cephRBDVolumeDriver) Unmount(r *volume.UnmountRequest) error {
 	vol, found := d.volumes[mount]
 	if !found {
 		// FIXME: is this an error or just a log and a return nil?
-		//return fmt.Errorf("WARN: Volume is not in known mounts: ignoring request to unmount: %s/%s", pool, name)
-		log.Printf("WARN: Volume is not in known mounts: ignoring request to unmount: %s/%s", pool, name)
-		return nil
-		/**
+		//return fmt.Errorf("ERROR: Volume is not in known mounts: ignoring request to unmount: %s/%s", pool, name)
+		//return nil
+		log.Printf("WARN: Volume is not in known mounts: got request to unmount: %s/%s", pool, name)
 		// set up a fake Volume with defaults ...
 		// - device is /dev/rbd/<pool>/<image> in newer ceph versions
-		// - assume we are the locker (will fail if locked from another host)
+		// - assume we are the locker (this will fail if locked from another host)
+		// - assume we have the same ID (false assumption but needed in our use case)
 		vol = &Volume{
 			Pool:   pool,
 			Name:   name,
 			Device: fmt.Sprintf("/dev/rbd/%s/%s", pool, name),
 			Locker: d.localLockerCookie(),
-			ID, r.ID,
+			ID:     r.ID,
 		}
-		*/
 	}
 
 	// if found - double check ID
